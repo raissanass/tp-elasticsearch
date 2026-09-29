@@ -47,5 +47,27 @@
 
 **Nettoyage :** `DELETE essai` et `DELETE essai2` → le cluster repasse en `green` (plus aucun shard non assigné).
 
+## Partie 2 — Ingestion en Python
+
+### Exercice 2.2 — Idempotence et identifiants
+
+**Le nombre de documents a-t-il doublé ?** Non : après la deuxième exécution sans `--reset`, l'index contient toujours 5 000 documents. Le script annonce 5 000 documents indexés, mais chacun a remplacé le document existant de même `_id` (sa `_version` passe de 1 à 2, visible avec `GET offres/_doc/OFF-00002`).
+
+**Pourquoi fixer `_id` à partir du champ `id` est-il essentiel ?** Avec l'action `index`, Elasticsearch remplace un document qui a le même `_id`. En utilisant l'identifiant métier (`OFF-00001`…), une même offre a toujours le même `_id` : relancer l'ingestion (après une panne, une mise à jour des données…) ne crée pas de doublons. Le script est idempotent.
+
+**Que se passerait-il avec des identifiants générés par Elasticsearch ?** Chaque exécution créerait de nouveaux `_id` aléatoires : les 5 000 offres seraient ajoutées une deuxième fois, soit 10 000 documents, puis 15 000 à la troisième exécution, etc. On aurait des doublons impossibles à distinguer, qui fausseraient les recherches et les statistiques.
+
+### Exercice 2.3 — Provoquer une erreur de mapping
+
+**Le lot entier est-il rejeté ou seulement ce document ?** Seulement ce document. Le script affiche « 5000 documents indexés, 1 erreurs » : l'offre `OFF-99999` est refusée avec un statut 400 (`strict_dynamic_mapping_exception` : « dynamic introduction of [prime] within [_doc] is not allowed »), car le champ `prime` n'existe pas dans le mapping strict. Les autres documents du même lot sont bien indexés : l'API `_bulk` renvoie un statut par opération, et une erreur n'annule pas les autres.
+
+**Intérêt de `raise_on_error=False` pour un pipeline :** avec la valeur par défaut (`True`), `helpers.bulk` lèverait une exception à la première erreur et le script s'arrêterait sans afficher le bilan. Avec `False`, l'ingestion va jusqu'au bout, et on récupère la liste des documents rejetés avec la raison du rejet. On peut alors les journaliser, les corriger ou les renvoyer plus tard, sans bloquer le chargement de milliers de documents valides à cause d'un seul document invalide.
+
+### Exercice 2.4 — Vérifier dans Kibana
+
+`GET _cat/indices/offres?v` : index `green`, 5 000 documents. `GET offres/_count` renvoie 5 000 et `GET offres/_doc/OFF-00002` renvoie l'offre « Analyste Cybersécurité Senior » (Cévennes Data).
+
+Data view `offres` créée avec `date_publication` comme champ temporel. Avec la période « Last 1 year », Discover affiche 4 968 documents et non 5 000 : la période se termine à l'instant présent (29/09/2026), alors que 32 offres sont datées du 30/09/2026, donc exclues. En prolongeant la date de fin, on retrouve les 5 000 offres. Les dates, stockées en UTC à minuit, sont affichées à 02:00 car Kibana utilise le fuseau du navigateur (Paris, UTC+2).
+
 
 
