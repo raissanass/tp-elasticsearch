@@ -1,0 +1,26 @@
+# Partie 2 — Ingestion en Python
+# Le livrable principal est ingest.py
+# Commandes lancées dans le terminal :
+#   python ingest.py --reset   -> 5000 documents indexés, 0 erreurs
+#   python ingest.py           -> idempotence : toujours 5000 documents
+
+# Exercice 2.2 — Idempotence : la version du document passe à 2 après la 2e exécution
+GET offres/_doc/OFF-00002
+
+GET offres/_count
+
+# Exercice 2.3 — Après ajout de OFF-99999 avec le champ "prime" :
+#   5000 documents indexés, 1 erreurs (strict_dynamic_mapping_exception)
+# Vérification : le document rejeté n'existe pas
+GET offres/_doc/OFF-99999
+
+# Exercice 2.4 — Vérifier dans Kibana
+GET _cat/indices/offres?v
+
+GET offres/_count
+
+GET offres/_doc/OFF-00002
+
+# Offres datées du 30/09/2026, absentes de Discover avec « Last 1 year »
+GET offres/_count
+{ "query": { "range": { "date_publication": { "gte": "2026-09-30" } } } }
