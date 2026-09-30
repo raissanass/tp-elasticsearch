@@ -69,5 +69,69 @@
 
 Data view `offres` créée avec `date_publication` comme champ temporel. Avec la période « Last 1 year », Discover affiche 4 968 documents et non 5 000 : la période se termine à l'instant présent (29/09/2026), alors que 32 offres sont datées du 30/09/2026, donc exclues. En prolongeant la date de fin, on retrouve les 5 000 offres. Les dates, stockées en UTC à minuit, sont affichées à 02:00 car Kibana utilise le fuseau du navigateur (Paris, UTC+2).
 
+## Partie 3 — Recherche et analyseurs
+
+### Exercice 3.1 — Voir travailler un analyseur
+
+**Tokens obtenus :**
+- `standard` : `les`, `développeuses`, `travaillaient`, `sur`, `l'analyse`, `des`, `données` (découpage et minuscules seulement).
+- `french` : `developeu`, `travailaient`, `analys`, `done`.
+
+**Quels mots disparaissent avec `french` ?** Les mots vides : `les`, `sur`, `des`. Les positions des tokens restants sont conservées (1, 2, 4, 6), ce qui permet encore les recherches de phrase.
+
+**Que devient `l'analyse` ?** Avec `standard`, c'est un seul token `l'analyse`. Avec `french`, l'élision retire `l'`, puis la racinisation donne `analys`.
+
+**« donnée » et « données » donnent-ils le même terme ?** Avec `standard` : non (`donnée` ≠ `données`). Avec `french` : oui, les deux deviennent `done` (accents retirés, pluriel et féminin supprimés, lettres doublées réduites).
+
+**Conséquence pour la recherche :** comme le même analyseur est appliqué au document et à la question, l'analyseur `french` permet de retrouver un document quelle que soit la forme du mot (singulier ou pluriel, masculin ou féminin, avec ou sans article élidé) : on gagne en rappel. C'est pourquoi `titre` et `description` utilisent `french`. En contrepartie, la racinisation peut rapprocher des mots différents et abîmer des termes techniques ; c'est pour cela que `competences.texte` utilise `standard`.
+
+### Exercice 3.2 — `match` contre `term`
+
+**Pourquoi les deux requêtes `term` renvoient-elles 0 résultat ?** `term` cherche la valeur exacte, sans aucune analyse.
+- `ville` est un `keyword` : la valeur stockée est `"Paris"` avec une majuscule, donc `"paris"` ne correspond à rien.
+- `titre` est un champ `text` analysé par `french` : l'index ne contient que des tokens (`data`, `engine`…), jamais la chaîne entière « Data Engineer Senior ». `term` ne doit pas être utilisé sur un champ `text`.
+
+**Corrections :**
+- `{ "term": { "ville": "Paris" } }` → 1 492 résultats.
+- `{ "term": { "titre.brut": "Data Engineer Senior" } }` (sous-champ `keyword`) → 103 résultats.
+
+**Effet de `"operator": "and"` :** la requête `match` sur « projets bancaires » passe de 4 190 à 393 résultats. Par défaut, `match` combine les tokens avec un OU (un seul mot suffit, et « projet » est très fréquent). Avec `and`, tous les tokens doivent être présents : on gagne en précision et on perd en rappel.
+
+
+### Exercice 3.3 — Plusieurs champs, pondération et fautes de frappe
+
+**Sans correction :** `multi_match` sur « kubernetis terraform » (champs `titre`, `competences.texte`, `description`) → 739 résultats. Le token `kubernetis` n'existe dans aucun document : seules les offres mentionnant Terraform (dans les compétences ou la description) sont trouvées. Beaucoup de scores sont identiques, car le type par défaut `best_fields` ne garde que le score du meilleur champ.
+
+**Quel paramètre rattrape la faute ?** `"fuzziness": "AUTO"` : il tolère des différences de lettres (distance d'édition) selon la longueur du mot (0 erreur jusqu'à 2 lettres, 1 erreur de 3 à 5 lettres, 2 au-delà). `kubernetis` est à 1 lettre de `kubernetes` : on passe à 969 résultats, et le score maximal monte de 3,10 à 5,74, car les deux mots contribuent désormais.
+
+**Effet du poids `titre^3` :** sur « kubernetis terraform », aucun changement (mêmes résultats, mêmes scores), car aucun titre ne contient ces mots : multiplier un score nul ne change rien. Sur « devops kubernetis », le poids change nettement l'ordre : sans poids, les « Architecte Cloud » et « Ingénieur DevOps » sont mélangés en tête ; avec `titre^3`, les offres dont le titre contient « DevOps » passent toutes devant. Le poids sert à dire qu'un mot trouvé dans le titre est plus significatif que le même mot trouvé dans une longue description.
+
+### Exercice 3.4 — Requête `bool`
+
+Requête : `must` = `multi_match` « données » sur `titre` et `description` ; `filter` = `term` contrat CDI, `terms` ville [Montpellier, Toulouse], `range` salaire_max ≥ 50 000 ; `must_not` = `term` teletravail « aucun » ; `should` = `term` competences « Elasticsearch ».
+
+**Comparaison des `_score` avec et sans `should` :** 25 résultats dans les deux cas : le `should` n'est pas obligatoire quand un `must` ou un `filter` est présent, il n'exclut rien. En revanche, il modifie le classement : les meilleures offres passent de 2,05 à 4,01, soit un bonus d'environ 1,97 pour les offres qui demandent Elasticsearch. Elles remontent donc en tête.
+
+**Pourquoi placer les critères exacts dans `filter` plutôt que dans `must` ?**
+1. **Pertinence :** en contexte filtre, aucun score n'est calculé. Le classement ne dépend alors que de la pertinence textuelle (« données »), sans être faussé par des critères oui/non comme le contrat ou la ville.
+2. **Performance :** ne pas calculer de score est plus rapide, et les résultats d'un filtre peuvent être mis en cache par Elasticsearch, puis réutilisés par les requêtes suivantes qui ont le même filtre.
+
+### Exercice 3.5 — Recherche géographique
+
+Requête : `geo_distance` de 20 km autour de (43.6108, 3.8767) dans un `filter`, et tri `_geo_distance` croissant en km.
+
+**Résultats :** 340 offres à moins de 20 km de Montpellier. La plus proche est à environ 0,19 km du point. Le tableau `sort` de chaque résultat contient la distance calculée, dans l'unité demandée (`unit: "km"`).
+
+**Le `_score` vaut `null` :** la requête n'utilise qu'un filtre (pas de calcul de pertinence) et le tri est imposé par la distance, pas par le score. Elasticsearch ne calcule donc pas le score, qui ne servirait pas à classer les résultats.
+
+### Exercice 3.6 — Pagination et surlignage
+
+Requête 3.4 reprise avec `"from": 5, "size": 5` (page 2, 5 résultats par page : `from` = (page − 1) × size), `_source` limité à `titre`, `entreprise`, `ville`, et un `highlight`.
+
+**Résultats :** `hits.total.value` reste à 25 (la pagination ne change pas le total), mais seuls 5 documents sont renvoyés. Avec un surlignage sur `description` seulement, aucun bloc `highlight` n'apparaissait : ces offres correspondent grâce à leur titre (« Administrateur Bases de Données »), pas à leur description. En ajoutant `titre` au surlignage, on obtient `"Administrateur Bases de <em>Données</em> Lead"` : les termes trouvés sont entourés de balises `<em>`, prêtes à être affichées dans une page web.
+
+**Pourquoi `from` + `size` est-il limité à 10 000 par défaut ?** Pour afficher les résultats à partir de la position `from`, chaque shard doit trouver et trier ses `from + size` meilleurs documents, puis le nœud coordinateur doit fusionner et trier tous ces résultats avant d'en jeter la plus grande partie. Plus on va loin, plus cela coûte en mémoire et en calcul : une pagination profonde pourrait surcharger le cluster. Le réglage `index.max_result_window` fixe donc la limite à 10 000.
+
+**Quelle API utiliser au-delà ?** `search_after` avec un point in time (PIT) : on ouvre un PIT (`POST offres/_pit?keep_alive=1m`), qui fige une vue cohérente de l'index, puis on demande la page suivante en passant les valeurs de tri du dernier résultat de la page précédente (`search_after`). Il n'y a plus de documents à sauter : chaque page coûte le même prix, quelle que soit sa profondeur.
 
 
