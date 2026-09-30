@@ -134,4 +134,40 @@ Requête 3.4 reprise avec `"from": 5, "size": 5` (page 2, 5 résultats par page 
 
 **Quelle API utiliser au-delà ?** `search_after` avec un point in time (PIT) : on ouvre un PIT (`POST offres/_pit?keep_alive=1m`), qui fige une vue cohérente de l'index, puis on demande la page suivante en passant les valeurs de tri du dernier résultat de la page précédente (`search_after`). Il n'y a plus de documents à sauter : chaque page coûte le même prix, quelle que soit sa profondeur.
 
+## Partie 4 — Agrégations
+
+### Exercice 4.1 — Offres et salaire moyen par ville
+
+**Quelle ville a le salaire moyen le plus élevé ?** Paris, avec un `salaire_min` moyen d'environ 57 442 €, devant Grenoble (53 046 €) et Nantes (52 125 €).
+
+**Sur combien d'offres la moyenne est-elle calculée ?** Pas sur toutes : à Paris, 994 offres sur 1 492 ont un `salaire_min` (mesuré avec une sous-agrégation `value_count`). Le champ est absent pour certains contrats, et `avg` ignore les documents qui n'ont pas le champ, sans les compter comme des zéros. Le `doc_count` d'un paquet et le nombre de valeurs utilisées pour la moyenne sont donc différents.
+
+**Erreur en remplaçant `ville` par `titre` :** `illegal_argument_exception` : « Fielddata is disabled on [titre] ». `titre` est un champ `text` : il est stocké en tokens dans un index inversé, adapté à la recherche mais pas au regroupement ni au tri. Activer `fielddata` est déconseillé (forte consommation mémoire, et regroupement par mots isolés au lieu des titres entiers). La correction consiste à agréger sur le sous-champ `keyword` : `"field": "titre.brut"`.
+
+### Exercice 4.2 — Publications par mois
+
+Requête : `date_histogram` sur `date_publication` avec `"calendar_interval": "month"` (et `"format": "yyyy-MM"` pour des clés lisibles), contenant une sous-agrégation `terms` sur `contrat`.
+
+**Résultats :** 6 mois, d'avril à septembre 2026, pour un total de 5 000 offres : 763 (avril), 865 (mai), 820 (juin), 835 (juillet), 880 (août, le maximum), 837 (septembre). Avril est un peu plus bas car la période couverte commence début avril.
+
+**Ventilation par contrat :** chaque mois, le CDI est largement majoritaire (environ 55 %, par exemple 476 sur 880 en août), suivi de l'alternance, puis du CDD et du freelance à des niveaux proches ; le stage est le contrat le plus rare. La répartition reste stable d'un mois à l'autre.
+
+**Remarque :** `calendar_interval` respecte les mois réels (28 à 31 jours), contrairement à `fixed_interval` qui découpe en durées fixes (par exemple 30 jours).
+
+### Exercice 4.3 — Tranches de salaire et statistiques
+
+Requête : agrégation `range` sur `salaire_min` (`from` inclus, `to` exclu) avec trois tranches nommées, et agrégation `stats` sur `experience_annees`.
+
+**Tranches de salaire :** < 40 k : 484 offres ; 40–55 k : 1 363 ; ≥ 55 k : 1 542. Le total (3 389) est inférieur à 5 000 : les 1 611 offres sans `salaire_min` n'entrent dans aucune tranche. Parmi les offres qui affichent un salaire, la tranche ≥ 55 k est la plus représentée (environ 45 %).
+
+**Statistiques d'expérience :** calculées sur les 5 000 offres (le champ est toujours présent) : minimum 0 an, maximum 15 ans, moyenne d'environ 5,9 ans (somme 29 564). L'agrégation `stats` fournit ces cinq valeurs en une seule fois.
+
+### Exercice 4.4 — Requête + agrégation
+
+Requête : `match_phrase` sur `titre` « Data Engineer » (les deux mots doivent se suivre, contrairement à `match` qui accepterait « Data Analyst »), avec `"size": 0`, une agrégation `terms` sur `competences` (`size: 5`) et une agrégation `terms` sur `teletravail`.
+
+**Résultats (462 offres) :** les 5 compétences les plus demandées sont Airflow (315), Spark (313), Kafka (312), Python (311) et SQL (301). Le télétravail le plus fréquent est `partiel` (284 offres, soit 61 %), devant `aucun` (109) et `total` (69).
+
+**L'agrégation porte-t-elle sur tout l'index ou seulement sur les résultats de la requête ?** Seulement sur les résultats de la requête. La même agrégation sans `query` (5 000 offres) donne un top 5 totalement différent : Python (1 320), Elasticsearch (1 279), Linux (1 003), Git (1 000), Docker (986). Airflow, Spark et Kafka, caractéristiques du métier de Data Engineer, n'y figurent pas. La répartition du télétravail est en revanche proche (61 % de `partiel` dans les deux cas).
+
 
