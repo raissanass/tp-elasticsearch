@@ -263,3 +263,55 @@ Mise en œuvre : ajout de `DEAD_LETTER_QUEUE_ENABLE=true` dans l'environnement d
 **Quel réglage change ce comportement ?** `queue.type: persisted` (dans `logstash.yml` ou `pipelines.yml`, par pipeline). La file est alors écrite sur disque : les événements reçus et non encore envoyés survivent à l'arrêt et sont traités au redémarrage. On obtient une garantie de livraison **« au moins une fois »** (*at-least-once*) : aucun événement n'est perdu, mais un événement peut être envoyé deux fois (par exemple s'il a été indexé juste avant l'arrêt, sans que Logstash ait eu le temps de le marquer comme traité).
 
 **Pourquoi le `document_id` devient-il alors indispensable ?** Puisqu'un même événement peut être envoyé plusieurs fois, il faut que ces renvois ne créent pas de doublons. Avec `document_id => "%{id}"`, un renvoi remplace simplement le document de même `_id` : l'ingestion est idempotente, et la garantie « au moins une fois » devient en pratique « exactement une fois » dans l'index.
+
+## Partie 3 — Transformer les logs d'accès
+### Exercice 3.1 — Générer les logs
+
+`python data/generate_access_logs.py` → `data/access.log`, 20 700 lignes au format Apache combined (23/09/2026 au 29/09/2026). Fichier exclu de Git (il se régénère).
+
+### Exercice 3.2 — Mettre au point le motif
+
+**Champs extraits par `%{COMBINEDAPACHELOG}` (Grok Debugger) :** `clientip` (203.0.113.123), `ident` et `auth` (`-`), `timestamp` (23/Sep/2026:00:00:39 +0200), `verb` (GET), `request` (/offres/OFF-01468), `httpversion` (1.1), `response` (200), `bytes` (43686), `referrer` et `agent`. Le Grok Debugger utilise les noms historiques ; dans Logstash 9 (mode ECS), le même motif produit `source.address`, `http.request.method`, `url.original`, `http.version`, `http.response.status_code`, `http.response.body.bytes`, `http.request.referrer` et `user_agent.original`.
+
+**Type de `http.response.status_code` :** dans le Grok Debugger, `response` est une chaîne (`"200"`) : grok extrait du texte par défaut. La version ECS du motif utilisée par Logstash convertit le code et la taille en entiers (vérifié à l'exercice 3.4 : type `long`).
+
+**Pourquoi `timestamp` doit-il encore être traité ?** C'est une simple chaîne. Sans le filtre `date`, `@timestamp` contiendrait l'heure de lecture par Logstash : toutes les requêtes sembleraient avoir eu lieu au même moment. Le filtre `date` lit la chaîne avec le format `dd/MMM/yyyy:HH:mm:ss Z` (mois en anglais, d'où `locale => "en"`) et la place dans `@timestamp`.
+
+**Motif pour extraire `OFF-01468` de `/offres/OFF-01468/postuler` :** motif personnalisé `OFFRE_ID OFF-[0-9]{5}` et motif `^/offres/%{OFFRE_ID:offre_id}` → `{ "offre_id": "OFF-01468" }`. Dans `web.conf`, le champ cible est `[labels][offre_id]`.
+
+### Exercice 3.3 — `web.conf`
+
+- `grok` avec `%{COMBINEDAPACHELOG}` : découpe la ligne en champs ECS.
+- `date` sur `timestamp` (format `dd/MMM/yyyy:HH:mm:ss Z`, `locale => "en"`) : date réelle de la requête dans `@timestamp`, puis suppression de `timestamp`.
+- `useragent` sur `[user_agent][original]` : navigateur, système et appareil.
+- Condition `if [url][original] =~ /^\/offres\/OFF-/` : second `grok` avec le motif `OFFRE_ID` → `[labels][offre_id]` (8 511 événements concernés).
+- Suppression de `[event][original]` seulement si `grok` a réussi (on garde la ligne brute en cas d'échec pour diagnostiquer).
+- Sortie `elasticsearch` en data stream : `data_stream_type => "logs"`, `data_stream_dataset => "web"`, `data_stream_namespace => "default"` → `logs-web-default`.
+
+L'API de supervision confirme 20 700 événements en entrée et en sortie du pipeline `web`.
+
+### Exercice 3.4 — Vérifier le data stream
+
+**Documents et échecs de grok :** 20 700 documents et 0 événement portant l'étiquette `_grokparsefailure`. (Un premier essai a donné 20 841 documents : Logstash tournait pendant la génération de `access.log`, et 141 lignes avaient été lues une première fois. Après `DELETE _data_stream/logs-web-default` et un redémarrage propre : 20 700.)
+
+**Index caché :** `.ds-logs-web-default-2026.10.01-000001`. `.ds-` est le préfixe des index de data stream (le point les rend cachés), `logs-web-default` le nom du data stream (`type-dataset-namespace`), `2026.10.01` la date de création de l'index (et non celle des logs), et `000001` le numéro de génération, incrémenté à chaque rollover géré par la politique `logs`.
+
+**Premier événement :** `@timestamp` = `2026-09-22T22:00:39.000Z`, soit le 23/09/2026 à 00:00:39 (+02:00) : le filtre `date` a bien fonctionné. L'événement contient `source.address`, `http.request.method`, `url.original`, `user_agent.name` = Chrome Mobile, `user_agent.os.name` = Android et `labels.offre_id` = `OFF-01468`.
+
+**Type de `http.response.status_code` :** `long`. C'est un nombre : on peut filtrer par intervalle (`>= 500`), faire des tranches et des statistiques ; en texte, les comparaisons seraient alphabétiques.
+
+**`index.mode` :** `logsdb`, le mode de stockage compact dédié aux logs, appliqué par défaut aux data streams `logs-*-*` depuis Elasticsearch 9.0. (Le data stream est `YELLOW` car le modèle `logs` prévoit une réplique, impossible à placer sur un seul nœud.)
+
+### Exercice 3.5 — Rejouer sans doublon ?
+
+**Constat :** après un redémarrage de Logstash, le nombre de documents passe de 20 700 à 41 400 : le fichier a été relu entièrement (`sincedb_path => "/dev/null"`) et chaque ligne a été ajoutée une seconde fois.
+
+**Pourquoi le problème ne se posait-il pas pour `offres` ?** La sortie du pipeline `offres` fixe `document_id => "%{id}"` : une relecture remplace le document de même `_id`. La sortie du pipeline `web` ne fixe pas de `_id` : Elasticsearch en génère un nouveau, aléatoire, à chaque envoi.
+
+**Peut-on mettre à jour ou remplacer un document dans un data stream ?** Non, pas par l'écriture normale : un data stream est en ajout seul. Il n'accepte que l'opération `create` ; on ne peut pas remplacer un document existant. Il faut passer par `_update_by_query` / `_delete_by_query` ou viser l'index caché. C'est adapté aux logs, écrits une fois et jamais modifiés.
+
+**Deux solutions pour rejouer sans doublon :**
+1. **La sincedb** : avec une sincedb persistante (chemin par défaut, dans le volume `lsdata`, au lieu de `/dev/null`), Logstash mémorise qu'il a lu `access.log` jusqu'au bout et ne le relit pas au redémarrage.
+2. **Un `_id` calculé avec `fingerprint`** : le filtre calcule une empreinte SHA-256 de la ligne (`message`), placée dans `[@metadata][fingerprint]`, puis la sortie utilise `document_id => "%{[@metadata][fingerprint]}"`. Une même ligne donne toujours le même `_id` : un renvoi est refusé comme doublon (conflit 409 sur `create`) au lieu d'être ajouté.
+
+Remise en état : `docker compose stop logstash`, `DELETE _data_stream/logs-web-default`, `docker compose up -d logstash` → 20 700 documents.
