@@ -1,0 +1,3 @@
+# Exercice 0 — Premier pipeline (commandes PowerShell, sur une ligne)
+# docker compose run --rm --no-deps logstash --path.data /tmp/essai -e 'input { stdin { } } output { stdout { codec => rubydebug } }'
+# docker compose run --rm --no-deps logstash --path.data /tmp/essai -e 'input { stdin { } } filter { mutate { uppercase => [''message''] } } output { stdout { codec => rubydebug } }'

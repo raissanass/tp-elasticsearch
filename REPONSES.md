@@ -170,4 +170,19 @@ Requête : `match_phrase` sur `titre` « Data Engineer » (les deux mots doivent
 
 **L'agrégation porte-t-elle sur tout l'index ou seulement sur les résultats de la requête ?** Seulement sur les résultats de la requête. La même agrégation sans `query` (5 000 offres) donne un top 5 totalement différent : Python (1 320), Elasticsearch (1 279), Linux (1 003), Git (1 000), Docker (986). Airflow, Spark et Kafka, caractéristiques du métier de Data Engineer, n'y figurent pas. La répartition du télétravail est en revanche proche (61 % de `partiel` dans les deux cas).
 
+## TP2
+## Exercice 0 — Premier pipeline
+
+**Quels champs Logstash a-t-il ajoutés à la phrase ?** La phrase tapée est placée dans `message`. Logstash ajoute :
+- `@timestamp` : horodatage de l'événement ;
+- `@version` : version du format d'événement (`"1"`) ;
+- `event.original` : copie brute de la ligne lue (nommage ECS) ;
+- `host.hostname` : nom de la machine qui a produit l'événement, ici l'identifiant du conteneur Docker.
+
+Avec le filtre `mutate { uppercase => ["message"] }`, `message` passe en majuscules, mais `event.original` reste inchangé : il conserve la donnée d'origine.
+
+**Que contient `@timestamp` ?** L'heure à laquelle Logstash a **reçu** l'événement (quand on a appuyé sur Entrée), en UTC (suffixe `Z`) : par exemple `08:44:15Z`, soit 10:44 à Paris. Ce n'est pas l'heure à laquelle l'événement s'est réellement produit. Pour des logs, il faudra la remplacer par la date écrite dans la ligne (filtre `date`, partie 3).
+
+**À quoi sert `--path.data /tmp/essai` ?** Logstash utilise un dossier de données (file d'attente, sincedb, verrou) et refuse de démarrer si une autre instance utilise déjà le même dossier. Le service `logstash` de la stack utilise `/usr/share/logstash/data` (volume `lsdata`) : en donnant un dossier séparé et jetable à ce Logstash d'essai, on évite le conflit de verrou et on ne mélange pas son état avec celui du vrai service.
+
 
