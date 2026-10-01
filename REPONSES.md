@@ -185,4 +185,35 @@ Avec le filtre `mutate { uppercase => ["message"] }`, `message` passe en majuscu
 
 **À quoi sert `--path.data /tmp/essai` ?** Logstash utilise un dossier de données (file d'attente, sincedb, verrou) et refuse de démarrer si une autre instance utilise déjà le même dossier. Le service `logstash` de la stack utilise `/usr/share/logstash/data` (volume `lsdata`) : en donnant un dossier séparé et jetable à ce Logstash d'essai, on évite le conflit de verrou et on ne mélange pas son état avec celui du vrai service.
 
+## Partie 1 — Recharger les offres avec Logstash
+
+### Exercice 1.2 — Premier lancement
+
+**Les documents sont-ils indexés ?** Non. Chaque offre est refusée : Logstash journalise « Could not index event to Elasticsearch » avec un statut **400** et une `strict_dynamic_mapping_exception` (« mapping set to strict, dynamic introduction of [host] within [_doc] is not allowed »). Le `_version` de `OFF-00002` ne change pas.
+
+**Quels noms de champs sont en cause ?** Elasticsearch cite `host`, le premier champ inconnu rencontré. L'événement contient en réalité cinq champs ajoutés par Logstash qui n'existent pas dans le mapping : `@timestamp`, `@version`, `host` (`host.name`), `log` (`log.file.path`) et `event` (`event.original`).
+
+**Lien avec `"dynamic": "strict"` :** comme à l'exercice 1.4 du TP d'introduction, le mapping strict rejette tout document qui contient un champ non déclaré. Les données de l'offre sont correctes, mais les métadonnées ajoutées par Logstash (nommage ECS) suffisent à faire refuser tout le document.
+
+### Exercice 1.3 — Corriger
+
+Ajout dans `filter` de `mutate { remove_field => ["@timestamp", "@version", "event", "log", "host"] }` : on supprime les champs ajoutés par Logstash que le mapping strict refuse.
+
+**Le nombre de documents a-t-il changé ?** Non : toujours 5 000.
+
+**Et le `_version` de `OFF-00002` ?** Il passe de 3 à 4. Grâce à `document_id => "%{id}"`, chaque offre est envoyée avec son identifiant métier : Elasticsearch remplace le document existant de même `_id` au lieu d'en créer un nouveau. Le `_version` augmente, mais le nombre de documents reste le même.
+
+**Pourquoi supprimer ces champs plutôt qu'assouplir le mapping ?** Ces champs sont des métadonnées techniques de Logstash (heure de lecture, nom du conteneur, chemin du fichier, ligne brute) qui n'ont aucun sens métier pour une offre d'emploi. Assouplir le mapping (`dynamic: true`) les ajouterait à chaque offre, alourdirait l'index (`event.original` duplique toute la ligne) et ferait perdre la protection du mode strict contre les champs inattendus (fautes de frappe, données mal formées). Le mapping doit décrire les données métier ; c'est au pipeline de s'y adapter.
+
+**Pourquoi l'index `offres` doit-il exister avant le premier démarrage de Logstash ?** Avec `manage_template => false`, Logstash n'installe aucun modèle d'index. Si l'index n'existait pas, la première écriture le créerait automatiquement avec un mapping dynamique : `ville` ou `contrat` deviendraient `text` + `keyword`, `localisation` un objet de deux nombres au lieu d'un `geo_point`, l'analyseur `french` serait absent, et tous les champs ajoutés par Logstash seraient acceptés. Les recherches géographiques et les agrégations du TP d'introduction ne fonctionneraient plus correctement.
+
+### Exercice 1.4 — Relancer
+
+Après un nouveau redémarrage : toujours 5 000 documents, et le `_version` de `OFF-00002` passe à 5.
+
+**Combien de fois le fichier a-t-il été lu ?** Une fois par démarrage de Logstash : avec `sincedb_path => "/dev/null"`, Logstash ne mémorise pas sa position de lecture, donc il relit `offres.ndjson` entièrement à chaque démarrage. Le fichier a été lu trois fois (exercices 1.2, 1.3 et 1.4) ; le `_version` augmente de 1 à chaque lecture réussie.
+
+**Avec la sincedb par défaut ?** Logstash enregistrerait dans un fichier sincedb (dans son dossier de données, le volume `lsdata`) qu'il a déjà lu `offres.ndjson` jusqu'au bout. Au redémarrage suivant, il ne relirait pas le fichier : `_version` resterait à 4. C'est le comportement souhaité en production, où l'on ne veut traiter chaque fichier qu'une fois.
+
+**Et si `document_id` n'était pas renseigné ?** Elasticsearch générerait un `_id` aléatoire pour chaque document : chaque lecture du fichier ajouterait 5 000 nouvelles offres (10 000 au 2e démarrage, 15 000 au 3e…). L'ingestion ne serait plus idempotente, et les recherches et statistiques seraient faussées par les doublons.
 
