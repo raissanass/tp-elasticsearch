@@ -1,0 +1,141 @@
+# Exercice 4.1 — Vue d'ensemble (ES|QL, période du 23/09/2026 au 30/09/2026)
+
+# Répartition par code HTTP
+FROM logs-web-default
+| STATS requetes = COUNT(*) BY http.response.status_code
+| SORT requetes DESC
+
+# Répartition par méthode
+FROM logs-web-default
+| STATS requetes = COUNT(*) BY http.request.method
+| SORT requetes DESC
+
+# Volume par jour
+FROM logs-web-default
+| STATS requetes = COUNT(*) BY jour = BUCKET(@timestamp, 1 day)
+| SORT jour
+
+# Volume moyen par jour
+FROM logs-web-default
+| STATS requetes = COUNT(*) BY jour = BUCKET(@timestamp, 1 day)
+| STATS moyenne_par_jour = AVG(requetes)
+
+# Exercice 4.2 — L'incident
+
+# Erreurs serveur par heure
+FROM logs-web-default
+| WHERE http.response.status_code >= 500
+| STATS erreurs = COUNT(*) BY heure = BUCKET(@timestamp, 1 hour)
+| SORT erreurs DESC
+| LIMIT 10
+
+# Erreurs par tranche de 5 minutes sur l'heure de l'incident (UTC)
+FROM logs-web-default
+| WHERE http.response.status_code >= 500
+    AND @timestamp >= "2026-09-28T12:00:00Z" AND @timestamp < "2026-09-28T13:00:00Z"
+| STATS erreurs = COUNT(*) BY tranche = BUCKET(@timestamp, 5 minutes)
+| SORT tranche
+
+# Début, fin et nombre de 503
+FROM logs-web-default
+| WHERE http.response.status_code == 503
+| STATS debut = MIN(@timestamp), fin = MAX(@timestamp), erreurs = COUNT(*)
+
+# URL touchées pendant l'incident, par section du site
+FROM logs-web-default
+| WHERE @timestamp >= "2026-09-28T12:00:00Z" AND @timestamp < "2026-09-28T12:45:00Z"
+| EVAL section = CASE(
+    url.original == "/", "accueil",
+    url.original LIKE "/offres/*", "offres",
+    url.original LIKE "/recherche*", "recherche",
+    url.original LIKE "/api/*", "api",
+    "statique et autres")
+| STATS requetes = COUNT(*), erreurs_503 = SUM(CASE(http.response.status_code == 503, 1, 0)) BY section
+| SORT erreurs_503 DESC
+
+# Volume sur l'API avant, pendant et après l'incident
+FROM logs-web-default
+| WHERE url.original LIKE "/api/*"
+    AND @timestamp >= "2026-09-28T11:00:00Z" AND @timestamp < "2026-09-28T14:00:00Z"
+| STATS requetes = COUNT(*), erreurs_503 = SUM(CASE(http.response.status_code == 503, 1, 0))
+    BY tranche = BUCKET(@timestamp, 15 minutes)
+| SORT tranche
+
+# Volume habituel de l'API par heure
+FROM logs-web-default
+| WHERE url.original LIKE "/api/*"
+| STATS requetes = COUNT(*) BY heure = BUCKET(@timestamp, 1 hour)
+| STATS moyenne_par_heure = AVG(requetes), max_par_heure = MAX(requetes)
+
+# Exercice 4.3 — L'activité suspecte
+
+# Adresses à l'origine des 404
+FROM logs-web-default
+| WHERE http.response.status_code == 404
+| STATS erreurs_404 = COUNT(*) BY source.address
+| SORT erreurs_404 DESC
+| LIMIT 5
+
+# Moment et durée du scan
+FROM logs-web-default
+| WHERE source.address == "203.0.113.66" AND http.response.status_code == 404
+| STATS debut = MIN(@timestamp), fin = MAX(@timestamp), erreurs_404 = COUNT(*)
+
+# URL demandées par le robot
+FROM logs-web-default
+| WHERE source.address == "203.0.113.66" AND http.response.status_code == 404
+| STATS tentatives = COUNT(*) BY url.original
+| SORT tentatives DESC
+
+# User agent du robot
+FROM logs-web-default
+| WHERE source.address == "203.0.113.66" AND http.response.status_code == 404
+| STATS requetes = COUNT(*) BY user_agent.original, user_agent.name
+
+# Les autres 404
+FROM logs-web-default
+| WHERE http.response.status_code == 404 AND source.address != "203.0.113.66"
+| STATS erreurs = COUNT(*), adresses = COUNT_DISTINCT(source.address) BY url.original
+| SORT erreurs DESC
+| LIMIT 10
+
+# Exercice 4.4 — Les offres les plus consultées
+
+# Top 10 des offres consultées (ES|QL, Discover)
+FROM logs-web-default
+| WHERE http.request.method == "GET" AND http.response.status_code == 200
+    AND labels.offre_id IS NOT NULL
+| STATS vues = COUNT(*) BY labels.offre_id
+| SORT vues DESC
+| LIMIT 10
+
+# Titres, villes et contrats (Dev Tools)
+GET offres/_search
+{
+  "size": 10,
+  "query": {
+    "ids": {
+      "values": ["OFF-04662", "OFF-03141", "OFF-01153", "OFF-02899", "OFF-01660",
+                 "OFF-00901", "OFF-03524", "OFF-03923", "OFF-03126", "OFF-03145"]
+    }
+  },
+  "_source": ["id", "titre", "entreprise", "ville", "contrat"]
+}
+
+# Exercice 4.5 — Le public
+
+# Répartition par système d'exploitation
+FROM logs-web-default
+| STATS requetes = COUNT(*) BY user_agent.os.name
+| SORT requetes DESC
+
+# Part du mobile
+FROM logs-web-default
+| EVAL appareil = CASE(user_agent.os.name IN ("Android", "iOS"), "mobile", "ordinateur ou autre")
+| STATS requetes = COUNT(*) BY appareil
+
+# Navigateurs les plus utilisés
+FROM logs-web-default
+| STATS requetes = COUNT(*) BY user_agent.name
+| SORT requetes DESC
+| LIMIT 5

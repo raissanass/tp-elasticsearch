@@ -315,3 +315,67 @@ L'API de supervision confirme 20 700 événements en entrée et en sortie du pip
 2. **Un `_id` calculé avec `fingerprint`** : le filtre calcule une empreinte SHA-256 de la ligne (`message`), placée dans `[@metadata][fingerprint]`, puis la sortie utilise `document_id => "%{[@metadata][fingerprint]}"`. Une même ligne donne toujours le même `_id` : un renvoi est refusé comme doublon (conflit 409 sur `create`) au lieu d'être ajouté.
 
 Remise en état : `docker compose stop logstash`, `DELETE _data_stream/logs-web-default`, `docker compose up -d logstash` → 20 700 documents.
+
+
+## Partie 4 — Enquête dans Kibana
+
+Data view **Logs web** sur `logs-web-*`, champ temporel `@timestamp`. Période absolue : du 23/09/2026 00:00 au 30/09/2026 00:00 (20 700 requêtes).
+
+### Exercice 4.1 — Vue d'ensemble
+
+**Répartition par code HTTP :** 200 (OK) : environ 17 800 requêtes, soit 86 % du trafic ; 201 (Created, candidatures) : environ 1 490 ; 304 (Not Modified, contenus en cache) : 488 ; 404 (Not Found) : 508 ; 503 (Service Unavailable) : 402 ; 500 (Internal Server Error) : 5. Les 402 réponses 503 et les 508 réponses 404 sont les deux anomalies à investiguer.
+
+**Répartition par méthode :** deux méthodes seulement : GET (environ 19 210 requêtes, 93 % : consultations de pages, recherches, appels à l'API et fichiers statiques) et POST (environ 1 490 requêtes, 7 % : envoi des candidatures, ce qui correspond au nombre de réponses 201).
+
+**Volume moyen par jour :** 2 957 requêtes par jour en moyenne (20 700 requêtes sur 7 jours). Les jours ordinaires se situent entre 2 830 et 2 890 requêtes ; le 26 et le 28 septembre sont au-dessus, ce qui correspond aux deux pics visibles dans l'histogramme (nuit du 26, après-midi du 28).
+
+### Exercice 4.2 — L'incident (rapport)
+
+**Jour et créneau :** lundi 28 septembre 2026, de 14:00:08 à 14:44:56 (heure de Paris), soit 12:00 à 12:45 UTC. Par heure, la tranche 14:00-15:00 concentre 402 erreurs 5xx, contre 0 ou 1 pour toutes les autres heures de la semaine. Par tranches de 5 minutes, les erreurs sont régulières (35 à 53 par tranche, environ 9 par minute) de 14:00 à 14:44, puis cessent brutalement.
+
+**URL touchées et non touchées :** seule l'API (`/api/…`) est touchée : 402 requêtes sur 403 en erreur pendant l'incident. Les pages d'offres (41 requêtes), la recherche (17), l'accueil (12) et les fichiers statiques (5) répondent normalement, sans aucune erreur. Ce n'est donc pas une panne de tout le serveur, mais une indisponibilité du service API.
+
+**Nombre d'erreurs et durée :** 402 réponses 503 (Service Unavailable) en environ 45 minutes. Les 5 réponses 500 de la semaine sont des erreurs isolées, sans lien avec l'incident.
+
+**Comportement des clients :** le volume de requêtes sur l'API explose pendant l'incident : 122 à 145 requêtes par quart d'heure, contre 1 à 8 avant et après (moyenne de la semaine : 17,5 requêtes par heure ; l'heure de l'incident est le maximum de la semaine, avec 404 requêtes). Le trafic redevient normal dès 14:45. Explication probable : les clients de l'API (front-end, application, partenaires) relancent automatiquement leurs requêtes en échec, sans délai. Ce n'est pas une hausse du nombre d'utilisateurs, mais une tempête de relances (*retry storm*), qui augmente la charge sur un service déjà en difficulté et peut retarder son rétablissement.
+
+**Recommandations :** côté clients, espacer les relances avec un délai croissant (*exponential backoff*) et un nombre maximal de tentatives ; côté serveur, renvoyer un en-tête `Retry-After` avec les 503 et protéger l'API par un disjoncteur (*circuit breaker*) ; côté supervision, une alerte sur le taux de 5xx (partie 5) aurait signalé l'incident dès les premières minutes.
+
+### Exercice 4.3 — L'activité suspecte
+
+**Adresse IP à l'origine de la rafale de 404 :** `203.0.113.66`, avec 300 réponses 404, soit 59 % des 508 réponses 404 de la semaine. Aucune autre adresse n'en dépasse 3.
+
+**Moment et durée :** le samedi 26 septembre 2026, de 03:12:00 à 03:16:59 (heure de Paris) : 300 requêtes en 5 minutes, soit une requête par seconde, très régulière, en pleine nuit. Cette activité correspond au pic nocturne visible le 26 dans l'histogramme. En dehors de cette rafale, la même adresse apparaît aussi dans quelques requêtes ordinaires (codes 200 et 201) ; seules ses 404 forment le scan.
+
+**URL demandées et objectif :** `/admin` (59), `/.git/config` (55), `/.env` (53), `/phpmyadmin/` (46), `/server-status` (44) et `/wp-login.php` (43). Ce robot est un scanner de vulnérabilités : il teste une liste de chemins connus pour trouver une interface d'administration exposée (`/admin`, phpMyAdmin, connexion WordPress), des fichiers contenant des secrets ou le code source (`.env`, `.git/config`) ou des informations internes du serveur (`/server-status`). Il teste des technologies que le site n'utilise pas (WordPress, phpMyAdmin) : c'est un balayage automatique, pas une attaque ciblée. Toutes les tentatives ont échoué (404) : aucun fichier sensible n'est exposé.
+
+**`user_agent.original` :** `Mozilla/5.0 zgrab/0.x`. zgrab est un outil de scan d'Internet à grande échelle (projet ZMap). Le filtre `useragent` ne reconnaît aucun navigateur (`user_agent.name` = `Other`). Un vrai navigateur annonce son système, son moteur de rendu et sa version (par exemple `Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36`). Le comportement le trahit aussi : rythme régulier d'une requête par seconde, en pleine nuit, sans page d'origine (`referrer`), uniquement des chemins sensibles et aucun fichier statique (images, CSS).
+
+**Les autres 404 (208) :** elles concernent des pages d'offres inexistantes (`/offres/OFF-09347`, `/offres/OFF-09223`…, numéros au-delà de `OFF-05000`), avec 2 ou 3 erreurs par URL venant d'autant d'adresses différentes, réparties sur la semaine. Ce sont des visiteurs qui suivent des liens périmés (offres retirées, anciens favoris, résultats de moteurs de recherche). Elles ne sont pas inquiétantes pour la sécurité ; on pourrait les améliorer avec une page « offre plus disponible » proposant des offres similaires, ou un code 410 Gone pour que les moteurs de recherche retirent ces pages.
+
+**Recommandations :** bloquer ou limiter le débit de l'adresse (pare-feu, *rate limiting*), et créer une alerte sur une rafale de 404 provenant d'une même adresse.
+
+### Exercice 4.4 — Les offres les plus consultées
+
+Top 10 des `labels.offre_id` sur les requêtes `GET` avec code 200 (ES|QL), puis titres retrouvés avec une seule requête `ids` sur l'index `offres` (possible car le `_id` de chaque offre est son identifiant métier) :
+
+| Rang | Offre | Vues | Titre | Ville | Contrat |
+| --- | --- | --- | --- | --- | --- |
+| 1 | OFF-04662 | 8 | Développeur Front-end Senior | Bordeaux | Freelance |
+| 2 | OFF-03141 | 7 | Développeur Python Confirmé | Bordeaux | CDI |
+| 2 | OFF-01153 | 7 | Développeur Java Confirmé | Toulouse | Freelance |
+| 4 | OFF-02899 | 6 | Data Engineer (Alternance) | Lyon | Alternance |
+| 4 | OFF-01660 | 6 | Architecte Cloud Senior | Lyon | CDI |
+| 4 | OFF-00901 | 6 | Développeur Java Junior | Paris | CDI |
+| 4 | OFF-03524 | 6 | Développeur Python (Alternance) | Toulouse | Alternance |
+| 4 | OFF-03923 | 6 | Architecte Cloud Confirmé | Lyon | CDI |
+| 4 | OFF-03126 | 6 | Administrateur Bases de Données Junior | Lyon | CDI |
+| 4 | OFF-03145 | 6 | Data Engineer Lead | Montpellier | CDI |
+
+Les vues sont très dispersées : la plus consultée n'a que 8 vues en une semaine, et plusieurs offres sont ex æquo à 6 vues, donc le classement au-delà de la 3e place est en partie arbitraire. On observe surtout des postes de développeurs et de data/cloud, souvent à Lyon et en CDI, mais ces tendances restent fragiles vu les faibles volumes.
+
+### Exercice 4.5 — Le public
+
+**Part du trafic mobile :** environ 8 150 requêtes sur 20 700 proviennent d'Android ou d'iOS (`user_agent.os.name`), soit environ 39 % ; le reste (environ 61 %) vient d'ordinateurs (Mac OS X, Windows, Linux) ou d'autres clients. Les cinq systèmes ont des parts presque égales (environ 4 000 à 4 150 requêtes chacun). Les quelque 300 requêtes classées `Other` correspondent au robot zgrab de l'exercice 4.3, dont le user agent n'indique aucun système.
+
+**Trois navigateurs les plus utilisés (`user_agent.name`) :** Safari (environ 4 150 requêtes), Mobile Safari (environ 4 100) et Chrome (environ 4 060), suivis de près par Chrome Mobile (environ 4 060) et Firefox (environ 4 000). Les écarts sont inférieurs à 2 %, donc le classement est peu significatif. Le filtre `useragent` distingue les versions mobile et ordinateur d'un même navigateur ; regroupés par famille, on obtient Safari (environ 8 250), Chrome (environ 8 120) puis Firefox (environ 4 000). Une répartition aussi uniforme est caractéristique de données générées.
